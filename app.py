@@ -12,7 +12,7 @@ import re
 import secrets
 import sqlite3
 from contextlib import asynccontextmanager, contextmanager
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from html import escape
 from pathlib import Path
 from typing import Annotated, Literal
@@ -154,6 +154,73 @@ def init_database():
         """)
         con.execute("CREATE INDEX IF NOT EXISTS idx_locations_tst ON locations(tst)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_locations_device_tst ON locations(device,tst)")
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+              username TEXT PRIMARY KEY COLLATE NOCASE,
+              password_salt TEXT NOT NULL,
+              password_hash TEXT NOT NULL,
+              role TEXT NOT NULL CHECK(role IN ('admin','user')),
+              active INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS manual_times (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              date TEXT NOT NULL,
+              site TEXT NOT NULL,
+              device TEXT NOT NULL,
+              start INTEGER NOT NULL,
+              end INTEGER NOT NULL,
+              note TEXT NOT NULL DEFAULT '',
+              created_by TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              CHECK(end > start)
+            )
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_manual_times_date ON manual_times(date)")
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS app_settings (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL
+            )
+        """)
+        salt, password_hash = hash_password(PASSWORD)
+        con.execute("""
+            INSERT OR IGNORE INTO users
+              (username,password_salt,password_hash,role,active,created_at)
+            VALUES (?,?,?,'admin',1,?)
+        """, (USERNAME, salt, password_hash, datetime.now(timezone.utc).isoformat()))
+        defaults = {
+            "timezone": TIMEZONE,
+            "max_gap_minutes": str(GAP_MINUTES),
+            "exit_grace_minutes": str(EXIT_GRACE_MINUTES),
+            "min_inside_samples": str(MIN_INSIDE_SAMPLES),
+        }
+        con.executemany("INSERT OR IGNORE INTO app_settings(key,value) VALUES(?,?)", defaults.items())
+
+
+def hash_password(password: str, salt: str | None = None) -> tuple[str, str]:
+    salt = salt or secrets.token_hex(16)
+    result = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), PASSWORD_ITERATIONS)
+    return salt, result.hex()
+
+
+def get_runtime_settings() -> RuntimeSettings:
+    with connection() as con:
+        values = {row["key"]: row["value"] for row in
+                  con.execute("SELECT key,value FROM app_settings")}
+    try:
+        settings = RuntimeSettings(
+            timezone=values.get("timezone", TIMEZONE),
+            max_gap_minutes=int(values.get("max_gap_minutes", GAP_MINUTES)),
+            exit_grace_minutes=int(values.get("exit_grace_minutes", EXIT_GRACE_MINUTES)),
+            min_inside_samples=int(values.get("min_inside_samples", MIN_INSIDE_SAMPLES)),
+        )
+        ZoneInfo(settings.timezone)
+        return settings
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise HTTPException(status_code=500, detail="Invalid runtime settings") from exc
 
 
 def check_config():
@@ -190,29 +257,121 @@ async def private_headers(request: Request, call_next):
     return response
 
 
-def _basic_ok(value: str) -> bool:
+def authenticate_basic(value: str) -> dict | None:
     if not value.lower().startswith("basic "):
-        return False
+        return None
     try:
         raw = base64.b64decode(value[6:].strip(), validate=True).decode("utf-8")
         username, password = raw.split(":", 1)
     except (ValueError, UnicodeDecodeError):
-        return False
-    return hmac.compare_digest(username, USERNAME) & hmac.compare_digest(password, PASSWORD) == 1
+        return None
+    if not USERNAME_RE.fullmatch(username):
+        return None
+    with connection() as con:
+        row = con.execute("SELECT * FROM users WHERE username=? COLLATE NOCASE", (username,)).fetchone()
+    if row is None or not row["active"]:
+        return None
+    _, password_hash = hash_password(password, row["password_salt"])
+    if not hmac.compare_digest(password_hash, row["password_hash"]):
+        return None
+    return {"username": row["username"], "role": row["role"]}
+
+
+def require_user(request: Request) -> dict:
+    user = authenticate_basic(request.headers.get("authorization", ""))
+    if user is None:
+        raise HTTPException(status_code=401, detail="Authentication required",
+                            headers={"WWW-Authenticate": 'Basic realm="GPS Receiver"'})
+    return user
+
+
+def require_admin(user: Annotated[dict, Depends(require_user)]) -> dict:
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Administrator permission required")
+    return user
 
 
 def require_read(request: Request):
-    if not _basic_ok(request.headers.get("authorization", "")):
+    user = authenticate_basic(request.headers.get("authorization", ""))
+    if user is None:
         raise HTTPException(status_code=401, detail="Authentication required",
                             headers={"WWW-Authenticate": 'Basic realm="GPS Receiver"'})
+    return require_admin(user)
 
 
 def require_ingest(request: Request):
     header = request.headers.get("authorization", "")
     token_ok = header.startswith("Bearer ") and hmac.compare_digest(header[7:], INGEST_TOKEN)
-    if not (token_ok or _basic_ok(header)):
+    user = authenticate_basic(header) if not token_ok else None
+    if not (token_ok or (user is not None and user["role"] == "admin")):
         raise HTTPException(status_code=401, detail="Invalid GPS credentials",
                             headers={"WWW-Authenticate": 'Basic realm="GPS Receiver"'})
+
+
+@app.get("/api/users", dependencies=[Depends(require_admin)])
+def list_users():
+    with connection() as con:
+        rows = con.execute("SELECT username,role,active,created_at FROM users ORDER BY username COLLATE NOCASE")
+        return {"users": [dict(row) for row in rows]}
+
+
+@app.post("/api/users", dependencies=[Depends(require_admin)], status_code=201)
+def create_user(user: UserCreate):
+    salt, password_hash = hash_password(user.password)
+    try:
+        with connection() as con:
+            con.execute("""
+                INSERT INTO users(username,password_salt,password_hash,role,active,created_at)
+                VALUES(?,?,?,?,1,?)
+            """, (user.username, salt, password_hash, user.role, datetime.now(timezone.utc).isoformat()))
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="That username already exists") from exc
+    return {"username": user.username, "role": user.role, "active": True}
+
+
+@app.put("/api/users/{username}", dependencies=[Depends(require_admin)])
+def update_user(username: str, updates: UserUpdate, request: Request):
+    actor = authenticate_basic(request.headers.get("authorization", ""))
+    with connection() as con:
+        current = con.execute("SELECT username,role,active FROM users WHERE username=? COLLATE NOCASE",
+                              (username,)).fetchone()
+        if current is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        new_role = updates.role or current["role"]
+        new_active = current["active"] if updates.active is None else updates.active
+        if (actor is not None and actor["username"].casefold() == current["username"].casefold() and
+                (new_role != "admin" or not new_active)):
+            raise HTTPException(status_code=409, detail="You cannot remove administrator access from your own account")
+        if current["role"] == "admin" and (new_role != "admin" or not new_active):
+            admin_count = con.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1").fetchone()[0]
+            if admin_count <= 1:
+                raise HTTPException(status_code=409, detail="At least one active administrator is required")
+        if updates.password is None:
+            con.execute("UPDATE users SET role=?,active=? WHERE username=?",
+                        (new_role, int(new_active), current["username"]))
+        else:
+            salt, password_hash = hash_password(updates.password)
+            con.execute("UPDATE users SET role=?,active=?,password_salt=?,password_hash=? WHERE username=?",
+                        (new_role, int(new_active), salt, password_hash, current["username"]))
+    return {"username": current["username"], "role": new_role, "active": bool(new_active)}
+
+
+@app.delete("/api/users/{username}", dependencies=[Depends(require_admin)])
+def delete_user(username: str, request: Request):
+    actor = authenticate_basic(request.headers.get("authorization", ""))
+    if actor is not None and actor["username"].casefold() == username.casefold():
+        raise HTTPException(status_code=409, detail="You cannot delete your own account")
+    with connection() as con:
+        current = con.execute("SELECT username,role,active FROM users WHERE username=? COLLATE NOCASE",
+                              (username,)).fetchone()
+        if current is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        if current["role"] == "admin" and current["active"]:
+            admin_count = con.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1").fetchone()[0]
+            if admin_count <= 1:
+                raise HTTPException(status_code=409, detail="At least one active administrator is required")
+        con.execute("DELETE FROM users WHERE username=?", (current["username"],))
+    return {"ok": True}
 
 
 def resolve_device(payload: dict) -> str:
@@ -420,6 +579,103 @@ def delete_site(name: str = Query(min_length=1, max_length=80)):
     return {"ok": True}
 
 
+def manual_entry_values(entry: ManualTimeEntry) -> tuple[int, int]:
+    settings = get_runtime_settings()
+    try:
+        start_time = time.fromisoformat(entry.start_time)
+        end_time = time.fromisoformat(entry.end_time)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Use valid 24-hour start and end times") from exc
+    zone = ZoneInfo(settings.timezone)
+    start = int(datetime.combine(entry.date, start_time, zone).timestamp())
+    end = int(datetime.combine(entry.date, end_time, zone).timestamp())
+    if end <= start:
+        raise HTTPException(status_code=422, detail="End time must be later than start time on the same date")
+    return start, end
+
+
+def manual_entry_response(row: sqlite3.Row) -> dict:
+    settings = get_runtime_settings()
+    zone = ZoneInfo(settings.timezone)
+    return {"id": row["id"], "date": row["date"], "site": row["site"],
+            "device": row["device"],
+            "start_time": datetime.fromtimestamp(row["start"], zone).strftime("%H:%M"),
+            "end_time": datetime.fromtimestamp(row["end"], zone).strftime("%H:%M"),
+            "hours": round((row["end"] - row["start"]) / 3600, 2),
+            "note": row["note"], "created_by": row["created_by"]}
+
+
+@app.get("/api/manual-times", dependencies=[Depends(require_admin)])
+def list_manual_times(start_date: date | None = None, end_date: date | None = None):
+    clauses, args = [], []
+    if start_date:
+        clauses.append("date >= ?")
+        args.append(start_date.isoformat())
+    if end_date:
+        clauses.append("date <= ?")
+        args.append(end_date.isoformat())
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    with connection() as con:
+        rows = con.execute("SELECT * FROM manual_times" + where + " ORDER BY start DESC", args).fetchall()
+    return {"entries": [manual_entry_response(row) for row in rows]}
+
+
+@app.post("/api/manual-times", dependencies=[Depends(require_admin)], status_code=201)
+def create_manual_time(entry: ManualTimeEntry, user: Annotated[dict, Depends(require_admin)]):
+    start, end = manual_entry_values(entry)
+    with connection() as con:
+        cursor = con.execute("""
+            INSERT INTO manual_times(date,site,device,start,end,note,created_by,updated_at)
+            VALUES(?,?,?,?,?,?,?,?)
+        """, (entry.date.isoformat(), entry.site, entry.device, start, end, entry.note,
+              user["username"], datetime.now(timezone.utc).isoformat()))
+        row = con.execute("SELECT * FROM manual_times WHERE id=?", (cursor.lastrowid,)).fetchone()
+    return {"entry": manual_entry_response(row)}
+
+
+@app.put("/api/manual-times/{entry_id}", dependencies=[Depends(require_admin)])
+def update_manual_time(entry_id: int, entry: ManualTimeEntry):
+    start, end = manual_entry_values(entry)
+    with connection() as con:
+        cursor = con.execute("""
+            UPDATE manual_times SET date=?,site=?,device=?,start=?,end=?,note=?,updated_at=? WHERE id=?
+        """, (entry.date.isoformat(), entry.site, entry.device, start, end, entry.note,
+              datetime.now(timezone.utc).isoformat(), entry_id))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Manual time entry not found")
+        row = con.execute("SELECT * FROM manual_times WHERE id=?", (entry_id,)).fetchone()
+    return {"entry": manual_entry_response(row)}
+
+
+@app.delete("/api/manual-times/{entry_id}", dependencies=[Depends(require_admin)])
+def delete_manual_time(entry_id: int):
+    with connection() as con:
+        cursor = con.execute("DELETE FROM manual_times WHERE id=?", (entry_id,))
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Manual time entry not found")
+    return {"ok": True}
+
+
+@app.get("/api/settings", dependencies=[Depends(require_admin)])
+def read_settings():
+    return get_runtime_settings().model_dump()
+
+
+@app.put("/api/settings", dependencies=[Depends(require_admin)])
+def update_settings(settings: RuntimeSettings):
+    try:
+        ZoneInfo(settings.timezone)
+    except ZoneInfoNotFoundError as exc:
+        raise HTTPException(status_code=422, detail="Unknown timezone") from exc
+    values = {key: str(value) for key, value in settings.model_dump().items()}
+    with connection() as con:
+        con.executemany("""
+            INSERT INTO app_settings(key,value) VALUES(?,?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """, values.items())
+    return settings.model_dump()
+
+
 def distance_m(lat_a: float, lon_a: float, lat_b: float, lon_b: float) -> float:
     r = 6_371_000.0
     phi1, phi2 = math.radians(lat_a), math.radians(lat_b)
@@ -434,15 +690,16 @@ def calculate_visits(points: list[dict], sites: list[WorkSite]):
     devices = {}
     for point in points:
         devices.setdefault(point["device"], []).append(point)
-    max_gap = GAP_MINUTES * 60
-    exit_grace = EXIT_GRACE_MINUTES * 60
+    settings = get_runtime_settings()
+    max_gap = settings.max_gap_minutes * 60
+    exit_grace = settings.exit_grace_minutes * 60
     for site in sites:
         for device, fixes in devices.items():
             start = last_inside = None
             count = 0
 
             def finish(end: int, reason: str):
-                if start is not None and count >= MIN_INSIDE_SAMPLES and end > start:
+                if start is not None and count >= settings.min_inside_samples and end > start:
                     visits.append({"site": site.name, "device": device,
                                    "start": start, "end": end, "duration_seconds": end-start,
                                    "end_reason": reason, "inside_samples": count})
@@ -480,7 +737,8 @@ def calculate_visits(points: list[dict], sites: list[WorkSite]):
 def reports_for_days(first: date, last: date):
     if first > last or (last-first).days > 90:
         raise HTTPException(status_code=400, detail="Use a date range of at most 91 days")
-    tz = ZoneInfo(TIMEZONE)
+    settings = get_runtime_settings()
+    tz = ZoneInfo(settings.timezone)
     low = int(datetime.combine(first, datetime.min.time(), tz).timestamp())
     high = int(datetime.combine(last + timedelta(days=1), datetime.min.time(), tz).timestamp())
     points = get_rows(low, high, limit=MAX_REPORT_POINTS + 1, ascending=True)
@@ -503,50 +761,100 @@ def reports_for_days(first: date, last: date):
                              "start_local": datetime.fromtimestamp(t, tz).isoformat(),
                              "end_local": datetime.fromtimestamp(stop, tz).isoformat()})
             t = stop
+    with connection() as con:
+        manual_rows = con.execute("SELECT * FROM manual_times WHERE date>=? AND date<=? ORDER BY start",
+                                  (first.isoformat(), last.isoformat())).fetchall()
+    manual_entries = [manual_entry_response(row) for row in manual_rows]
+    for row in manual_rows:
+        key = (row["date"], row["site"], row["device"])
+        daily[key] = daily.get(key, 0) + row["end"] - row["start"]
     totals = [{"date": d, "site": s, "device": dev, "seconds": seconds,
                "hours": round(seconds / 3600, 3)}
               for (d, s, dev), seconds in sorted(daily.items())]
-    return {"timezone": TIMEZONE, "from": first.isoformat(), "through": last.isoformat(),
+    return {"timezone": settings.timezone, "from": first.isoformat(), "through": last.isoformat(),
             "method": "Estimated from GPS; requires at least two accurate inside fixes. "
                       "Gaps and exits may undercount or overcount actual attendance.",
             "sites": [site.model_dump() for site in sites],
-            "totals": totals, "visits": segments, "points_examined": len(points)}
+            "totals": totals, "visits": segments, "manual_entries": manual_entries,
+            "points_examined": len(points)}
 
 
 def report_dates(start_date: date | None, end_date: date | None, days: int):
-    today = datetime.now(ZoneInfo(TIMEZONE)).date()
+    today = datetime.now(ZoneInfo(get_runtime_settings().timezone)).date()
     if start_date is None and end_date is None:
         return today - timedelta(days=days - 1), today
     return start_date or end_date or today, end_date or start_date or today
 
 
-@app.get("/api/hours", dependencies=[Depends(require_read)])
+@app.get("/api/hours")
 def hours(start_date: date | None = None, end_date: date | None = None,
-          days: int = Query(default=7, ge=1, le=91)):
-    first, last = report_dates(start_date, end_date, days)
-    return reports_for_days(first, last)
-
-
-@app.get("/api/hours.csv", dependencies=[Depends(require_read)])
-def hours_csv(start_date: date | None = None, end_date: date | None = None,
-              days: int = Query(default=7, ge=1, le=91)):
+          days: int = Query(default=7, ge=1, le=91),
+          user: Annotated[dict, Depends(require_user)] = None):
     first, last = report_dates(start_date, end_date, days)
     report = reports_for_days(first, last)
-    fields = ["date", "site", "device", "hours", "seconds"]
+    if user["role"] == "user":
+        return {"from": report["from"], "through": report["through"],
+                "totals": [{key: row[key] for key in ("date", "hours", "seconds")}
+                           for row in report["totals"]]}
+    return report
+
+
+@app.get("/api/hours.csv")
+def hours_csv(start_date: date | None = None, end_date: date | None = None,
+              days: int = Query(default=7, ge=1, le=91),
+              user: Annotated[dict, Depends(require_user)] = None):
+    first, last = report_dates(start_date, end_date, days)
+    report = reports_for_days(first, last)
+    fields = ["date", "hours", "seconds"] if user["role"] == "user" else ["date", "site", "device", "hours", "seconds"]
     return StreamingResponse(as_csv(report["totals"], fields), media_type="text/csv",
                              headers={"Content-Disposition": 'attachment; filename="gps-work-hours.csv"',
                                       "Cache-Control": "no-store"})
 
 
 def local_time(epoch: int) -> str:
-    return datetime.fromtimestamp(epoch, ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %I:%M:%S %p")
+    return datetime.fromtimestamp(epoch, ZoneInfo(get_runtime_settings().timezone)).strftime("%Y-%m-%d %I:%M:%S %p")
 
 
-@app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_read)])
-def dashboard():
+def user_dashboard(report: dict, username: str) -> HTMLResponse:
+    totals = "".join(
+        f"<tr><td>{escape(row['date'])}</td><td>{row['hours']:.2f}</td></tr>"
+        for row in report["totals"]
+    ) or "<tr><td colspan='2'>No time entries for these dates.</td></tr>"
+    return HTMLResponse("""<!doctype html><html lang='en'><head><meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'><title>Time report</title>
+<style>body{margin:0;background:#101820;color:#eef2f1;font:15px system-ui,sans-serif}main{max-width:760px;margin:48px auto;padding:24px}
+h1{font-size:26px}.hint{color:#b5c2c0}section{border-top:1px solid #42504e;padding:20px 0}
+form{display:flex;align-items:end;flex-wrap:wrap;gap:12px}label{display:block;font-size:13px;color:#b5c2c0;margin-bottom:5px}
+input,button{font:inherit;padding:9px 11px;border:1px solid #53635f;border-radius:3px;background:#172520;color:#eef2f1}
+button{background:#b8e4cd;color:#15251d;font-weight:650;cursor:pointer}table{border-collapse:collapse;width:100%;margin-top:18px}
+th,td{text-align:left;padding:11px;border-bottom:1px solid #354541}#error{color:#ffaaa4;min-height:20px}
+</style></head><body><main><h1>Time report</h1><p class='hint'>Signed in as """ + escape(username) + """</p>
+<section><form id='date-range'><div><label for='from'>From</label><input id='from' type='date' value='""" + report["from"] + """' required></div>
+<div><label for='through'>Through</label><input id='through' type='date' value='""" + report["through"] + """' required></div>
+<button type='submit'>View times</button></form><p id='error' role='status' aria-live='polite'></p>
+<table><thead><tr><th>Date</th><th>Hours</th></tr></thead><tbody id='rows'>""" + totals + """</tbody></table></section>
+<script>document.getElementById('date-range').addEventListener('submit',async event=>{
+event.preventDefault();const from=document.getElementById('from').value;const through=document.getElementById('through').value;
+const span=(Date.parse(through+'T00:00:00Z')-Date.parse(from+'T00:00:00Z'))/86400000;const error=document.getElementById('error');
+if(!from||!through||span<0||span>90){error.textContent='Choose a valid range of no more than 91 days.';return;}
+try{const response=await fetch('/api/hours?'+new URLSearchParams({start_date:from,end_date:through}));const report=await response.json();
+if(!response.ok)throw Error(report.detail||'Unable to load report.');const body=document.getElementById('rows');body.replaceChildren();
+if(!report.totals.length){const row=document.createElement('tr');const cell=document.createElement('td');cell.colSpan=2;cell.textContent='No time entries for these dates.';row.append(cell);body.append(row);}
+for(const total of report.totals){const row=document.createElement('tr');for(const value of [total.date,total.hours.toFixed(2)]){const cell=document.createElement('td');cell.textContent=value;row.append(cell);}body.append(row);}
+error.textContent='';}catch(exception){error.textContent=exception.message;}});</script></main></body></html>""")
+
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard(start_date: date | None = None, end_date: date | None = None,
+              user: dict = Depends(require_user)):
+    first, last = report_dates(start_date, end_date, 7)
+    report = reports_for_days(first, last)
+    if user["role"] == "user":
+        safe_report = {"from": report["from"], "through": report["through"],
+                       "totals": [{"date": row["date"], "hours": row["hours"]}
+                                  for row in report["totals"]]}
+        return user_dashboard(safe_report, user["username"])
     recent = get_rows(limit=100)
-    today = datetime.now(ZoneInfo(TIMEZONE)).date()
-    report = reports_for_days(today - timedelta(days=6), today)
     with connection() as con:
         count = con.execute("SELECT COUNT(*) FROM locations").fetchone()[0]
         last = con.execute("SELECT MAX(received_at) FROM locations").fetchone()[0]
@@ -626,6 +934,31 @@ label{display:block;color:#b4c1d7;font-size:13px;margin:13px 0 5px}
 <label for='accuracy'>Maximum GPS accuracy (meters)</label><input id='accuracy' name='max_accuracy_m' type='number' min='1' max='10000' step='1' value='75' required>
 <div class='map-actions'><button id='save-job' type='submit' disabled>Save as new job</button><button id='cancel-edit' class='secondary' type='button' hidden>Cancel edit</button></div></form><p id='map-status' class='status' role='status' aria-live='polite'></p>
 <h3>Saved jobs</h3><ul id='job-list' class='job-list'></ul></div></div></section>
+<section><h2>Manual time entries</h2><p class='hint'>Add or correct time records. These are included in hours reports.</p>
+<form id='manual-time-form' class='date-range'><input id='manual-time-id' type='hidden'>
+<div class='date-field'><label for='manual-date'>Date</label><input id='manual-date' type='date' value='""" + escape(report_end) + """' required></div>
+<div class='date-field'><label for='manual-site'>Job site</label><input id='manual-site' maxlength='80' required></div>
+<div class='date-field'><label for='manual-device'>Device / person</label><input id='manual-device' maxlength='64' value='manual' required></div>
+<div class='date-field'><label for='manual-start'>Start</label><input id='manual-start' type='time' required></div>
+<div class='date-field'><label for='manual-end'>End</label><input id='manual-end' type='time' required></div>
+<div class='date-field'><label for='manual-note'>Note</label><input id='manual-note' maxlength='300'></div>
+<button id='manual-save' type='submit'>Add time</button><button id='manual-cancel' class='secondary' type='button' hidden>Cancel edit</button></form>
+<p id='manual-status' class='status' role='status' aria-live='polite'></p>
+<div class='scroll'><table><thead><tr><th>Date</th><th>Site</th><th>Device</th><th>Start</th><th>End</th><th>Hours</th><th>Actions</th></tr></thead>
+<tbody id='manual-time-rows'></tbody></table></div></section>
+<section><h2>User management</h2><form id='new-user-form' class='date-range'>
+<div class='date-field'><label for='new-username'>Username</label><input id='new-username' minlength='3' maxlength='64' pattern='[A-Za-z0-9_.-]+' required></div>
+<div class='date-field'><label for='new-password'>Temporary password</label><input id='new-password' type='password' minlength='12' maxlength='256' required></div>
+<div class='date-field'><label for='new-role'>Permission</label><select id='new-role'><option value='user'>View times only</option><option value='admin'>Administrator</option></select></div>
+<button type='submit'>Add user</button></form><p id='user-status' class='status' role='status' aria-live='polite'></p>
+<div class='scroll'><table><thead><tr><th>User</th><th>Role</th><th>Active</th><th>New password</th><th>Actions</th></tr></thead>
+<tbody id='users-rows'></tbody></table></div></section>
+<section><h2>Time-tracking settings</h2><form id='settings-form' class='date-range'>
+<div class='date-field'><label for='settings-timezone'>Timezone</label><input id='settings-timezone' maxlength='64' required></div>
+<div class='date-field'><label for='settings-gap'>Maximum tracking gap (minutes)</label><input id='settings-gap' type='number' min='1' max='1440' required></div>
+<div class='date-field'><label for='settings-grace'>Exit grace (minutes)</label><input id='settings-grace' type='number' min='0' max='240' required></div>
+<div class='date-field'><label for='settings-samples'>Required inside fixes</label><input id='settings-samples' type='number' min='2' max='100' required></div>
+<button type='submit'>Save settings</button></form><p id='settings-status' class='status' role='status' aria-live='polite'></p></section>
 <nav><a href='/api/locations'>Recent locations JSON</a><a href='/api/export.csv'>Export all GPS CSV</a>
 <a id='hours-json' href='/api/hours?days=7'>Work hours JSON</a><a id='hours-csv' href='/api/hours.csv?days=7'>Work hours CSV</a></nav>
 <section><h2 id='hours-heading'>Worksite hours — """ + escape(report_start) + """ to """ + escape(report_end) + """</h2>
@@ -640,6 +973,7 @@ label{display:block;color:#b4c1d7;font-size:13px;margin:13px 0 5px}
 <tbody>""" + (row_html or "<tr><td colspan='5'>No GPS data received yet.</td></tr>") + """</tbody></table></div></section>
 <p><small>Last receiver upload: """ + escape(last or "never") + """ · Local timezone: """ + escape(TIMEZONE) + """</small></p>
 </main><script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script><script>
+const currentUsername = """ + json.dumps(user["username"]) + """;
 const map = L.map('map').setView([20, 0], 2);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
@@ -983,10 +1317,171 @@ document.getElementById('hours-range').addEventListener('submit', async event =>
         statusLine.textContent = error.message || 'Could not load the selected report.';
     }
 });
+let editingTimeId = null;
+async function loadManualTimes() {
+    const params = new URLSearchParams({start_date: document.getElementById('range-start').value,
+        end_date: document.getElementById('range-end').value});
+    const response = await fetch(`/api/manual-times?${params}`);
+    if (!response.ok) throw new Error('Could not load manual time entries.');
+    const entries = (await response.json()).entries;
+    const body = document.getElementById('manual-time-rows');
+    body.replaceChildren();
+    for (const entry of entries) {
+        const row = document.createElement('tr');
+        for (const value of [entry.date, entry.site, entry.device, entry.start_time,
+            entry.end_time, entry.hours.toFixed(2)]) {
+            const cell = document.createElement('td');
+            cell.textContent = value;
+            row.append(cell);
+        }
+        const actions = document.createElement('td');
+        const edit = document.createElement('button');
+        edit.type = 'button'; edit.className = 'secondary'; edit.textContent = 'Edit';
+        edit.addEventListener('click', () => {
+            editingTimeId = entry.id;
+            document.getElementById('manual-date').value = entry.date;
+            document.getElementById('manual-site').value = entry.site;
+            document.getElementById('manual-device').value = entry.device;
+            document.getElementById('manual-start').value = entry.start_time;
+            document.getElementById('manual-end').value = entry.end_time;
+            document.getElementById('manual-note').value = entry.note;
+            document.getElementById('manual-save').textContent = 'Save time';
+            document.getElementById('manual-cancel').hidden = false;
+        });
+        const remove = document.createElement('button');
+        remove.type = 'button'; remove.className = 'danger'; remove.textContent = 'Delete';
+        remove.setAttribute('aria-label', `Delete time on ${entry.date} at ${entry.site}`);
+        remove.addEventListener('click', async () => {
+            if (!confirm(`Delete ${entry.date} time at ${entry.site}?`)) return;
+            const result = await fetch(`/api/manual-times/${entry.id}`, {method: 'DELETE'});
+            if (!result.ok) { setStatus('Could not delete time entry.', true); return; }
+            await loadManualTimes();
+            document.getElementById('hours-range').requestSubmit();
+        });
+        actions.append(edit, remove);
+        row.append(actions);
+        body.append(row);
+    }
+}
+document.getElementById('manual-time-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    const payload = {date: document.getElementById('manual-date').value,
+        site: document.getElementById('manual-site').value.trim(),
+        device: document.getElementById('manual-device').value.trim(),
+        start_time: document.getElementById('manual-start').value,
+        end_time: document.getElementById('manual-end').value,
+        note: document.getElementById('manual-note').value.trim()};
+    const editing = editingTimeId !== null;
+    const response = await fetch(editing ? `/api/manual-times/${editingTimeId}` : '/api/manual-times', {
+        method: editing ? 'PUT' : 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+    if (!response.ok) {
+        const problem = await response.json().catch(() => ({}));
+        document.getElementById('manual-status').textContent = problem.detail || 'Could not save time entry.';
+        return;
+    }
+    document.getElementById('manual-status').textContent = editing ? 'Time entry updated.' : 'Time entry added.';
+    editingTimeId = null;
+    event.target.reset();
+    document.getElementById('manual-date').value = document.getElementById('range-end').value;
+    document.getElementById('manual-device').value = 'manual';
+    document.getElementById('manual-save').textContent = 'Add time';
+    document.getElementById('manual-cancel').hidden = true;
+    await loadManualTimes();
+    document.getElementById('hours-range').requestSubmit();
+});
+document.getElementById('manual-cancel').addEventListener('click', () => {
+    editingTimeId = null;
+    document.getElementById('manual-time-form').reset();
+    document.getElementById('manual-date').value = document.getElementById('range-end').value;
+    document.getElementById('manual-device').value = 'manual';
+    document.getElementById('manual-save').textContent = 'Add time';
+    document.getElementById('manual-cancel').hidden = true;
+});
+document.getElementById('hours-range').addEventListener('submit', () => {
+    loadManualTimes().catch(error => setStatus(error.message, true));
+});
+async function loadUsers() {
+    const response = await fetch('/api/users');
+    if (!response.ok) throw new Error('Could not load users.');
+    const users = (await response.json()).users;
+    const body = document.getElementById('users-rows');
+    body.replaceChildren();
+    for (const user of users) {
+        const row = document.createElement('tr');
+        const username = document.createElement('td'); username.textContent = user.username; row.append(username);
+        const roleCell = document.createElement('td');
+        const role = document.createElement('select');
+        for (const [value, label] of [['user', 'View times only'], ['admin', 'Administrator']]) {
+            const option = document.createElement('option'); option.value = value; option.textContent = label; role.append(option);
+        }
+        role.value = user.role; role.disabled = user.username.toLowerCase() === currentUsername.toLowerCase();
+        roleCell.append(role); row.append(roleCell);
+        const activeCell = document.createElement('td');
+        const active = document.createElement('input'); active.type = 'checkbox'; active.checked = Boolean(user.active);
+        active.disabled = user.username.toLowerCase() === currentUsername.toLowerCase();
+        activeCell.append(active); row.append(activeCell);
+        const passwordCell = document.createElement('td');
+        const password = document.createElement('input'); password.type = 'password'; password.minLength = 12; password.maxLength = 256;
+        password.autocomplete = 'new-password'; password.placeholder = 'Leave blank to keep'; passwordCell.append(password); row.append(passwordCell);
+        const actionCell = document.createElement('td');
+        const save = document.createElement('button'); save.type = 'button'; save.textContent = 'Save';
+        save.addEventListener('click', async () => {
+            const changes = {role: role.value, active: active.checked};
+            if (password.value) changes.password = password.value;
+            const result = await fetch(`/api/users/${encodeURIComponent(user.username)}`, {
+                method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(changes)});
+            if (!result.ok) { const problem = await result.json(); document.getElementById('user-status').textContent = problem.detail || 'Could not update user.'; return; }
+            document.getElementById('user-status').textContent = `Updated ${user.username}.`;
+            await loadUsers();
+        });
+        const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'danger'; remove.textContent = 'Delete';
+        remove.disabled = user.username.toLowerCase() === currentUsername.toLowerCase();
+        remove.addEventListener('click', async () => {
+            if (!confirm(`Delete user ${user.username}?`)) return;
+            const result = await fetch(`/api/users/${encodeURIComponent(user.username)}`, {method: 'DELETE'});
+            if (!result.ok) { const problem = await result.json(); document.getElementById('user-status').textContent = problem.detail || 'Could not delete user.'; return; }
+            await loadUsers();
+        });
+        actionCell.append(save, remove); row.append(actionCell); body.append(row);
+    }
+}
+document.getElementById('new-user-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    const payload = {username: document.getElementById('new-username').value.trim(),
+        password: document.getElementById('new-password').value, role: document.getElementById('new-role').value};
+    const response = await fetch('/api/users', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+    if (!response.ok) { const problem = await response.json(); document.getElementById('user-status').textContent = problem.detail || 'Could not add user.'; return; }
+    event.target.reset(); document.getElementById('user-status').textContent = `Added ${payload.username}.`;
+    await loadUsers();
+});
+async function loadSettings() {
+    const response = await fetch('/api/settings');
+    if (!response.ok) throw new Error('Could not load settings.');
+    const settings = await response.json();
+    document.getElementById('settings-timezone').value = settings.timezone;
+    document.getElementById('settings-gap').value = settings.max_gap_minutes;
+    document.getElementById('settings-grace').value = settings.exit_grace_minutes;
+    document.getElementById('settings-samples').value = settings.min_inside_samples;
+}
+document.getElementById('settings-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    const payload = {timezone: document.getElementById('settings-timezone').value.trim(),
+        max_gap_minutes: Number(document.getElementById('settings-gap').value),
+        exit_grace_minutes: Number(document.getElementById('settings-grace').value),
+        min_inside_samples: Number(document.getElementById('settings-samples').value)};
+    const response = await fetch('/api/settings', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+    const statusLine = document.getElementById('settings-status');
+    if (!response.ok) { const problem = await response.json(); statusLine.textContent = problem.detail || 'Invalid settings.'; return; }
+    statusLine.textContent = 'Settings saved.';
+    document.getElementById('hours-range').requestSubmit();
+});
 fetch('/api/locations?limit=1').then(response => response.ok ? response.json() : null).then(data => {
     const point = data?.locations?.[0];
     if (point) map.setView([point.lat, point.lon], 14);
 }).catch(() => {});
 loadJobs().catch(error => setStatus(error.message, true));
+loadManualTimes().catch(error => setStatus(error.message, true));
+loadUsers().catch(error => document.getElementById('user-status').textContent = error.message);
+loadSettings().catch(error => document.getElementById('settings-status').textContent = error.message);
 </script></body></html>""", headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
                                                              "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline' https://unpkg.com; script-src 'unsafe-inline' https://unpkg.com; img-src https://*.tile.openstreetmap.org https://unpkg.com data:; connect-src 'self' https://nominatim.openstreetmap.org; base-uri 'none'; form-action 'self'"})

@@ -16,7 +16,7 @@ docker compose ps
 
 `setup.sh` generates a random browser password and a separate random phone-ingest token in `.env`, creates `data/sites.json`, and restricts file permissions. **Do not upload, email, or publish the `.env` file.** The database is `/opt/colota-gps-receiver/data/locations.sqlite3` and survives container restarts and rebuilds.
 
-Open the browser dashboard on your LAN: `http://SERVER-LAN-IP:8765/`. Use the credentials in `.env` (`APP_USERNAME`/`APP_PASSWORD`).
+Open the browser dashboard on your LAN: `http://SERVER-LAN-IP:8765/`. Use the credentials in `.env` (`APP_USERNAME`/`APP_PASSWORD`). This account is bootstrapped as the first administrator. Administrators can create additional administrator accounts or **view times only** accounts from the dashboard. User accounts and password hashes are stored in the SQLite database; passwords are not stored in plain text.
 
 To see the phone token:
 
@@ -55,7 +55,7 @@ Private browser dashboard:
 
 `https://gps.yourdomain.com/`
 
-Keep NPM access lists / additional proxy password requirements disabled **for this host** unless Colota is configured to pass those credentials too. This app already authenticates every GPS POST and all location-read endpoints, with *separate credentials*. If you expose the dashboard publicly, Basic authentication protects it but is not equivalent to an MFA-based VPN; prefer restricting dashboard access with proxy route rules or a VPN for sensitive history. Disable caching on the proxy.
+Keep NPM access lists / additional proxy password requirements disabled **for this host** unless Colota is configured to pass those credentials too. The app authenticates GPS ingestion separately from dashboard accounts. Administrators can access GPS, jobs, manual time entries, users, and settings. A **view times only** account can access only date-filtered time summaries and their CSV export. If you expose the dashboard publicly, Basic authentication protects it but is not equivalent to an MFA-based VPN; prefer restricting dashboard access with proxy route rules or a VPN for sensitive history. Disable caching on the proxy.
 
 ## 3. Colota setup
 
@@ -131,6 +131,9 @@ Every route except `/healthz` needs authentication:
 - `GET /api/hours?days=7`: estimated worksite visits and daily hours as JSON.
 - `GET /api/hours?start_date=2026-10-01&end_date=2026-10-21`: explicit inclusive dates; up to 91 days per query.
 - `GET /api/hours.csv?days=7`: daily per-site hours CSV.
+- `GET /api/manual-times`, `POST /api/manual-times`, `PUT /api/manual-times/{id}`, `DELETE /api/manual-times/{id}`: administrator-only manual hours management.
+- `GET /api/users`, `POST /api/users`, `PUT /api/users/{username}`, `DELETE /api/users/{username}`: administrator-only account and permission management.
+- `GET /api/settings`, `PUT /api/settings`: administrator-only time tracking settings (timezone, tracking gap, exit grace, and required inside fixes).
 - `GET /healthz`: unprotected service health check, no location data.
 
 Exporting history requires the browser credentials, **not** the phone token. The dashboard shows the last 100 fixes and time tracked over the last 7 days. It opens OpenStreetMap only when a point link is clicked; it does not preload external map tiles or transmit GPS history to a map service.

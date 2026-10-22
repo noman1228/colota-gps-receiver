@@ -32,6 +32,11 @@ def post(c, payload, token=BEARER):
     return c.post("/api/location", json=payload, headers={"Authorization": token})
 
 
+def basic(username, password):
+    value = base64.b64encode(f"{username}:{password}".encode()).decode()
+    return {"Authorization": f"Basic {value}"}
+
+
 def test_security_ingest_and_duplicates(client):
     assert client.get("/").status_code == 401
     assert client.get("/api/locations").status_code == 401
@@ -48,6 +53,79 @@ def test_security_ingest_and_duplicates(client):
     assert result["locations"][0]["device"] == "truck"
     assert client.get("/", headers={"Authorization": BASIC}).status_code == 200
     assert client.get("/api/export.csv", headers={"Authorization": BASIC}).text.count("\n") == 3
+
+
+def test_user_account_permissions_and_times_only_access(client):
+    admin = {"Authorization": BASIC}
+    password = "viewer-password-123"
+    created = client.post("/api/users", json={"username": "times-user", "password": password}, headers=admin)
+    assert created.status_code == 201, created.text
+    viewer = basic("times-user", password)
+
+    page = client.get("/", headers=viewer)
+    assert page.status_code == 200
+    assert "Time report" in page.text
+    assert "map" not in page.text.lower()
+    assert "Manual time entries" not in page.text
+    assert "User management" not in page.text
+
+    report = client.get("/api/hours?start_date=2026-10-20&end_date=2026-10-21", headers=viewer)
+    assert report.status_code == 200
+    assert set(report.json()) == {"from", "through", "totals"}
+    assert set(report.json()["totals"][0]) <= {"date", "hours", "seconds"} if report.json()["totals"] else True
+    csv_response = client.get("/api/hours.csv?start_date=2026-10-20&end_date=2026-10-21", headers=viewer)
+    assert csv_response.status_code == 200
+    assert csv_response.text.splitlines()[0] == "date,hours,seconds"
+
+    for path in ("/api/locations", "/api/sites", "/api/users", "/api/settings", "/api/manual-times", "/api/export.csv"):
+        assert client.get(path, headers=viewer).status_code == 403, path
+    assert client.post("/api/sites", json={"name": "Nope", "lat": 43, "lon": -70,
+                                           "radius_m": 150}, headers=viewer).status_code == 403
+    assert client.put("/api/users/times-user", json={"role": "admin"}, headers=viewer).status_code == 403
+    manual = {"date": "2026-10-20", "site": "Test", "start_time": "08:00", "end_time": "09:00"}
+    assert client.post("/api/manual-times", json=manual, headers=viewer).status_code == 403
+    settings = {"timezone": "UTC", "max_gap_minutes": 25,
+                "exit_grace_minutes": 7, "min_inside_samples": 3}
+    assert client.put("/api/settings", json=settings, headers=viewer).status_code == 403
+
+    changed = client.put("/api/users/times-user", json={"active": False}, headers=admin)
+    assert changed.status_code == 200
+    assert client.get("/", headers=viewer).status_code == 401
+    assert client.delete("/api/users/times-user", headers=admin).status_code == 200
+
+
+def test_admin_manual_time_crud_and_settings(client):
+    admin = {"Authorization": BASIC}
+    assert client.put("/api/users/admin", json={"role": "user"}, headers=admin).status_code == 409
+    assert client.put("/api/users/admin", json={"active": False}, headers=admin).status_code == 409
+    entry = {"date": "2026-10-20", "site": "Warehouse", "device": "Crew A",
+             "start_time": "08:00", "end_time": "10:30", "note": "Setup"}
+    created = client.post("/api/manual-times", json=entry, headers=admin)
+    assert created.status_code == 201, created.text
+    entry_id = created.json()["entry"]["id"]
+    assert created.json()["entry"]["hours"] == 2.5
+
+    viewer_password = "viewer-password-123"
+    assert client.post("/api/users", json={"username": "times-user", "password": viewer_password},
+                       headers=admin).status_code == 201
+    viewer = basic("times-user", viewer_password)
+    report = client.get("/api/hours?start_date=2026-10-20&end_date=2026-10-20", headers=viewer).json()
+    assert report["totals"] == [{"date": "2026-10-20", "seconds": 9000, "hours": 2.5}]
+
+    changed = {**entry, "end_time": "11:00", "note": "Corrected"}
+    updated = client.put(f"/api/manual-times/{entry_id}", json=changed, headers=admin)
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["entry"]["hours"] == 3.0
+    assert client.delete(f"/api/manual-times/{entry_id}", headers=admin).status_code == 200
+    assert client.delete(f"/api/manual-times/{entry_id}", headers=admin).status_code == 404
+
+    settings = {"timezone": "UTC", "max_gap_minutes": 25,
+                "exit_grace_minutes": 7, "min_inside_samples": 3}
+    assert client.put("/api/settings", json=settings, headers=admin).json() == settings
+    assert client.get("/api/settings", headers=admin).json() == settings
+    assert client.put("/api/settings", json={**settings, "timezone": "Not/AZone"},
+                      headers=admin).status_code == 422
+    assert client.get("/api/settings", headers=viewer).status_code == 403
 
 
 def test_dashboard_address_search_is_enabled(client):
