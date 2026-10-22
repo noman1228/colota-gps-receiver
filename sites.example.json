@@ -1,0 +1,18 @@
+{
+  "sites": [
+    {
+      "name": "Main Jobsite",
+      "lat": 44.000000,
+      "lon": -70.000000,
+      "radius_m": 150,
+      "max_accuracy_m": 75
+    },
+    {
+      "name": "Second Jobsite",
+      "lat": 44.100000,
+      "lon": -70.100000,
+      "radius_m": 175,
+      "max_accuracy_m": 75
+    }
+  ]
+}
